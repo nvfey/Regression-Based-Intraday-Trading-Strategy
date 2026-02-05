@@ -100,7 +100,7 @@ resid_history = []       # optional if needed later
 
 in_position = False
 i = WINDOW
-
+prev_factor = None
 # =========================================================
 # 4. MAIN LOOP
 # =========================================================
@@ -130,23 +130,42 @@ while i < len(returns) - 20:
     Y = aligned.to_numpy()
     X -= X.mean(0)
     Y -= Y.mean(0)
-    cov = (X.T @ Y) / (len(X)-1)
-    corr = cov / np.outer(X.std(0), Y.std(0))
+
+    # Protect against zero standard deviation
+    X_std = X.std(0)
+    Y_std = Y.std(0)
+
+    if np.any(X_std == 0) or np.any(Y_std == 0):
+        i += 1
+        continue
+
+    cov = (X.T @ Y) / (len(X) - 1)
+    corr = cov / np.outer(X_std, Y_std)
 
     lagcorr = pd.DataFrame(corr, index=win.columns, columns=win.columns)
 
     # ---------------------------
     # 4.2 Target and peers selection
     # ---------------------------th
-    predictability = lagcorr.apply(lambda col: col.drop(col.name).abs().nlargest(TOPN).mean())
+    # Handle cases with fewer than TOPN peers
+    predictability = lagcorr.apply(
+        lambda col: col.drop(col.name).abs().nlargest(min(TOPN, len(col) - 1)).mean()
+    )
     target = predictability.idxmax()
 
-    peers = lagcorr[target].drop(target).abs().nlargest(TOPN).index.tolist()
+    available_peers = lagcorr[target].drop(target).abs()
+    n_peers = min(TOPN, len(available_peers))
+    peers = available_peers.nlargest(n_peers).index.tolist()
+
+    # Skip if we don't have enough peers
+    if len(peers) < 3:
+        i += 1
+        continue
 
     # ---------------------------
     # 4.3 PCA (stable window)
     # ---------------------------
-    pca_raw = returns.iloc[i - PCA_WINDOW:i]
+    pca_raw = returns.iloc[i - PCA_WINDOW:i-1]
     # Drop columns (symbols) with NaNs, not rows
     pca_slice = pca_raw.dropna(axis=1)
 
@@ -166,18 +185,21 @@ while i < len(returns) - 20:
     factor = pd.Series(factor_raw, index=pca_slice.index).ewm(span=5).mean()
 
     # stabilize direction
-    if 'prev_factor' in locals():
+    if prev_factor is not None and len(prev_factor) >= 50:
+        overlap_len = min(len(prev_factor), len(factor))
+        if overlap_len >= 50:
+            corr_check = np.corrcoef(prev_factor[-50:], factor[-50:])[0, 1]
 
-        corr = np.corrcoef(prev_factor[-50:], factor[-50:])[0, 1]
-
-        if corr < 0:
-            factor = -factor
+            # FIX: Protect against NaN
+            if not np.isnan(corr_check) and corr_check < 0:
+                factor = -factor
 
     prev_factor = factor.copy()
 
     # -----------------------------
     # 4.4 Regression (train on t-1)
     # -----------------------------
+
     Xreg = sm.add_constant(factor.iloc[:-1])
     yreg = pca_slice[target].iloc[:-1]
     model = sm.OLS(yreg, Xreg).fit()
@@ -185,16 +207,27 @@ while i < len(returns) - 20:
     beta = model.params.iloc[1]
     tval = model.tvalues.iloc[1]
     pval = model.pvalues.iloc[1]
+
     # ---------------------------------
     # 4.5 Out-of-sample prediction at t
     # ---------------------------------
-    factor_t = factor.iloc[-1]
-    factor_prev = factor.iloc[-2]
-    pred_ret = beta * (factor_t - factor_prev)
+
+    current_returns = returns.iloc[i][peers]
+
+    if current_returns.isna().any():
+        i += 1
+        continue
+
+    # Convert to DataFrame to preserve feature names
+    current_df = pd.DataFrame([current_returns.values], columns=peers)
+    factor_t_raw = pca.transform(current_df).flatten()[0]
+
+    factor_prev = factor.iloc[-1]
+    pred_ret = beta * (factor_t_raw - factor_prev)
 
     # normalize predicted value
     pred_std = (factor.diff().rolling(50).std().iloc[-1])
-    if pred_std == 0 or pd.isna(pred_std):
+    if pred_std == 0 or pd.isna(pred_std) or np.isnan(pred_std):
         i += 1
         continue
 
@@ -210,13 +243,19 @@ while i < len(returns) - 20:
     sig = np.sign(z_pred)
 
     # correlation filter
-    corr_strength = lagcorr[target].drop(target).abs().nlargest(TOPN).mean()
+    available_corrs = lagcorr[target].drop(target).abs()
+    n_corrs = min(TOPN, len(available_corrs))
+    corr_strength = available_corrs.nlargest(n_corrs).mean()
     corr_history.append(corr_strength)
     corr_hist_series = pd.Series(corr_history)
 
     # correlation stability = current strength / recent mean
     if len(corr_hist_series) >= 5:
-        corr_stability = corr_strength / corr_hist_series.tail(5).mean()
+        recent_mean = corr_hist_series.tail(5).mean()
+        if recent_mean > 0:
+            corr_stability = corr_strength / recent_mean
+        else:
+            corr_stability = 1
     else:
         corr_stability = 1
 
@@ -226,8 +265,9 @@ while i < len(returns) - 20:
         recent_vol = res.iloc[-5:].std()
         past_vol = res.iloc[-10:-5].std()
 
-        if recent_vol < past_vol:
-            sig = 0
+        if not np.isnan(recent_vol) and not np.isnan(past_vol) and past_vol > 0:
+            if recent_vol < past_vol:
+                sig = 0
 
     # Predictability stability filter
     if corr_stability < 0.80:
@@ -235,9 +275,8 @@ while i < len(returns) - 20:
 
     if len(corr_hist_series) >= 6:
         corr_slope = corr_hist_series.diff().tail(5).mean()
-
-        # allow small dips, block collapse
-        if corr_slope < -0.03:
+        # Check for NaN
+        if not np.isnan(corr_slope) and corr_slope < -0.03:
             sig = 0
 
     # t-stat filter
@@ -245,8 +284,12 @@ while i < len(returns) - 20:
         sig = 0
 
     # noise filter
-    noise_ratio = model.resid.std() / yreg.std()
-    if noise_ratio > 2:
+    yreg_std = yreg.std()
+    if yreg_std > 0:
+        noise_ratio = model.resid.std() / yreg_std
+        if noise_ratio > 2:
+            sig = 0
+    else:
         sig = 0
 
     # min predicted move
@@ -451,3 +494,4 @@ if len(signals_series) > 100:
     plt.legend()
     plt.grid(True)
     plt.show()
+
