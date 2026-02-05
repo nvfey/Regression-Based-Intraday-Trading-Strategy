@@ -74,7 +74,6 @@ TOPN = 15
 
 MIN_T = 2.8
 MAX_P = 0.01
-CORR_TH = 0.2
 
 PERSIST = 2
 MIN_PRED = 0.0007
@@ -494,4 +493,5 @@ if len(signals_series) > 100:
     plt.legend()
     plt.grid(True)
     plt.show()
+
 
